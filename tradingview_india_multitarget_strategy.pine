@@ -1,0 +1,174 @@
+//@version=5
+strategy(
+    "Indian Equity Multi-Target Strategy",
+    overlay=true,
+    initial_capital=100000,
+    pyramiding=0,
+    commission_type=strategy.commission.percent,
+    commission_value=0.03,
+    calc_on_every_tick=true,
+    process_orders_on_close=true
+)
+
+// ---------------------------
+// User Inputs
+// ---------------------------
+enableLong = input.bool(true, "Enable Long Trades")
+enableShort = input.bool(false, "Enable Short Trades (for F&O/intraday)")
+useSessionFilter = input.bool(true, "Use NSE Session Filter")
+marketSession = input.session("0915-1530", "NSE Session (IST)")
+
+emaFastLen = input.int(20, "EMA Fast Length", minval=1)
+emaSlowLen = input.int(50, "EMA Slow Length", minval=1)
+emaTrendLen = input.int(200, "EMA Trend Length", minval=1)
+
+rsiLen = input.int(14, "RSI Length", minval=1)
+rsiBull = input.int(55, "RSI Threshold (Long)", minval=1, maxval=99)
+rsiBear = input.int(45, "RSI Threshold (Short)", minval=1, maxval=99)
+
+volumeLen = input.int(20, "Volume SMA Length", minval=1)
+volumeMultiplier = input.float(1.2, "Volume Multiplier", minval=0.1, step=0.1)
+atrLen = input.int(14, "ATR Length", minval=1)
+minAtrPercent = input.float(0.35, "Minimum ATR % of Price", minval=0.0, step=0.05)
+
+stopAtrMultiplier = input.float(1.5, "Stop Loss ATR Multiplier", minval=0.1, step=0.1)
+rrTarget1 = input.float(1.0, "Target 1 (R Multiple)", minval=0.1, step=0.1)
+rrTarget2 = input.float(2.0, "Target 2 (R Multiple)", minval=0.2, step=0.1)
+rrTarget3 = input.float(3.0, "Target 3 (R Multiple)", minval=0.3, step=0.1)
+moveStopToBreakeven = input.bool(true, "Move Stop Loss to Entry after Target 1")
+
+tp1Input = input.float(33.0, "TP1 Exit Qty %", minval=0.0, maxval=100.0, step=0.5)
+tp2Input = input.float(33.0, "TP2 Exit Qty %", minval=0.0, maxval=100.0, step=0.5)
+tp3Input = input.float(34.0, "TP3 Exit Qty %", minval=0.0, maxval=100.0, step=0.5)
+
+qtyTotal = tp1Input + tp2Input + tp3Input
+tp1Qty = qtyTotal > 0 ? (tp1Input / qtyTotal) * 100 : 33.0
+tp2Qty = qtyTotal > 0 ? (tp2Input / qtyTotal) * 100 : 33.0
+tp3Qty = qtyTotal > 0 ? (tp3Input / qtyTotal) * 100 : 34.0
+
+// ---------------------------
+// Core Calculations
+// ---------------------------
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+emaTrend = ta.ema(close, emaTrendLen)
+rsiValue = ta.rsi(close, rsiLen)
+[macdLine, macdSignal, _] = ta.macd(close, 12, 26, 9)
+volumeSma = ta.sma(volume, volumeLen)
+atrValue = ta.atr(atrLen)
+
+sessionOk = not useSessionFilter or not na(time(timeframe.period, marketSession))
+trendLong = close > emaTrend and emaFast > emaSlow
+trendShort = close < emaTrend and emaFast < emaSlow
+volumeOk = volume > volumeSma * volumeMultiplier
+volatilityOk = (atrValue / close) * 100 >= minAtrPercent
+
+longSignal = enableLong and sessionOk and trendLong and volumeOk and volatilityOk and rsiValue > rsiBull and ta.crossover(macdLine, macdSignal)
+shortSignal = enableShort and sessionOk and trendShort and volumeOk and volatilityOk and rsiValue < rsiBear and ta.crossunder(macdLine, macdSignal)
+
+if longSignal and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long)
+
+if shortSignal and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short)
+
+// ---------------------------
+// Dynamic Targets and Stop
+// ---------------------------
+var float entryPrice = na
+var float stopPrice = na
+var float target1 = na
+var float target2 = na
+var float target3 = na
+var bool movedToBE = false
+
+newLong = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+flatNow = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if newLong
+    entryPrice := strategy.position_avg_price
+    riskPoints = atrValue * stopAtrMultiplier
+    stopPrice := entryPrice - riskPoints
+    target1 := entryPrice + riskPoints * rrTarget1
+    target2 := entryPrice + riskPoints * rrTarget2
+    target3 := entryPrice + riskPoints * rrTarget3
+    movedToBE := false
+
+if newShort
+    entryPrice := strategy.position_avg_price
+    riskPoints = atrValue * stopAtrMultiplier
+    stopPrice := entryPrice + riskPoints
+    target1 := entryPrice - riskPoints * rrTarget1
+    target2 := entryPrice - riskPoints * rrTarget2
+    target3 := entryPrice - riskPoints * rrTarget3
+    movedToBE := false
+
+if strategy.position_size > 0 and moveStopToBreakeven and not movedToBE and not na(target1) and high >= target1
+    stopPrice := entryPrice
+    movedToBE := true
+
+if strategy.position_size < 0 and moveStopToBreakeven and not movedToBE and not na(target1) and low <= target1
+    stopPrice := entryPrice
+    movedToBE := true
+
+if strategy.position_size > 0 and not na(stopPrice)
+    strategy.exit("L-TP1", "Long", stop=stopPrice, limit=target1, qty_percent=tp1Qty)
+    strategy.exit("L-TP2", "Long", stop=stopPrice, limit=target2, qty_percent=tp2Qty)
+    strategy.exit("L-TP3", "Long", stop=stopPrice, limit=target3, qty_percent=tp3Qty)
+
+if strategy.position_size < 0 and not na(stopPrice)
+    strategy.exit("S-TP1", "Short", stop=stopPrice, limit=target1, qty_percent=tp1Qty)
+    strategy.exit("S-TP2", "Short", stop=stopPrice, limit=target2, qty_percent=tp2Qty)
+    strategy.exit("S-TP3", "Short", stop=stopPrice, limit=target3, qty_percent=tp3Qty)
+
+if flatNow
+    entryPrice := na
+    stopPrice := na
+    target1 := na
+    target2 := na
+    target3 := na
+    movedToBE := false
+
+// ---------------------------
+// Visuals
+// ---------------------------
+plot(emaFast, "EMA Fast", color=color.new(color.aqua, 0))
+plot(emaSlow, "EMA Slow", color=color.new(color.orange, 0))
+plot(emaTrend, "EMA Trend", color=color.new(color.blue, 30), linewidth=2)
+
+plot(strategy.position_size != 0 ? entryPrice : na, "Entry", color=color.new(color.white, 0), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 ? stopPrice : na, "Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? target1 : na, "Target 1", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? target2 : na, "Target 2", color=color.new(color.green, 30), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? target3 : na, "Target 3", color=color.new(color.green, 55), style=plot.style_linebr, linewidth=2)
+
+plotshape(longSignal, title="Long Signal", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="BUY", textcolor=color.white, size=size.tiny)
+plotshape(shortSignal, title="Short Signal", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.tiny)
+
+levelText(v) =>
+    na(v) ? "NA" : str.tostring(v, format.mintick)
+
+var table levelTable = table.new(position.top_right, 2, 6, border_width=1)
+if barstate.islast
+    side = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    table.cell(levelTable, 0, 0, "Position", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(levelTable, 1, 0, side, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(levelTable, 0, 1, "Entry", text_color=color.white)
+    table.cell(levelTable, 1, 1, levelText(entryPrice), text_color=color.white)
+    table.cell(levelTable, 0, 2, "Stop Loss", text_color=color.red)
+    table.cell(levelTable, 1, 2, levelText(stopPrice), text_color=color.red)
+    table.cell(levelTable, 0, 3, "Target 1", text_color=color.lime)
+    table.cell(levelTable, 1, 3, levelText(target1), text_color=color.lime)
+    table.cell(levelTable, 0, 4, "Target 2", text_color=color.lime)
+    table.cell(levelTable, 1, 4, levelText(target2), text_color=color.lime)
+    table.cell(levelTable, 0, 5, "Target 3", text_color=color.lime)
+    table.cell(levelTable, 1, 5, levelText(target3), text_color=color.lime)
+
+// ---------------------------
+// Alerts
+// ---------------------------
+alertcondition(longSignal, "Long Entry", "Long entry signal on {{ticker}}")
+alertcondition(shortSignal, "Short Entry", "Short entry signal on {{ticker}}")
+alertcondition(strategy.position_size > 0 and not na(target1) and high >= target1, "Long Target 1 Hit", "Long Target 1 hit on {{ticker}}")
+alertcondition(strategy.position_size < 0 and not na(target1) and low <= target1, "Short Target 1 Hit", "Short Target 1 hit on {{ticker}}")
