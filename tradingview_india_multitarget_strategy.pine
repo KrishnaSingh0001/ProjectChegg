@@ -31,11 +31,26 @@ volumeMultiplier = input.float(1.2, "Volume Multiplier", minval=0.1, step=0.1)
 atrLen = input.int(14, "ATR Length", minval=1)
 minAtrPercent = input.float(0.35, "Minimum ATR % of Price", minval=0.0, step=0.05)
 
+useHtfTrend = input.bool(true, "Use Higher Timeframe Trend Filter")
+htfTf = input.timeframe("60", "Higher Timeframe")
+htfEmaLen = input.int(200, "HTF EMA Length", minval=1)
+useAdxFilter = input.bool(true, "Use ADX Trend Strength Filter")
+adxLen = input.int(14, "ADX Length", minval=1)
+adxMin = input.float(18.0, "Minimum ADX", minval=1.0, step=0.5)
+useEntryWindow = input.bool(true, "Use Intraday Entry Window")
+entryWindow = input.session("0920-1445", "Entry Window (IST)")
+breakoutLen = input.int(20, "Breakout Lookback", minval=2)
+maxTradesPerDay = input.int(2, "Max Trades Per Day", minval=1, maxval=10)
+cooldownBars = input.int(5, "Cooldown Bars Between Entries", minval=0)
+
 stopAtrMultiplier = input.float(1.5, "Stop Loss ATR Multiplier", minval=0.1, step=0.1)
 rrTarget1 = input.float(1.0, "Target 1 (R Multiple)", minval=0.1, step=0.1)
 rrTarget2 = input.float(2.0, "Target 2 (R Multiple)", minval=0.2, step=0.1)
 rrTarget3 = input.float(3.0, "Target 3 (R Multiple)", minval=0.3, step=0.1)
 moveStopToBreakeven = input.bool(true, "Move Stop Loss to Entry after Target 1")
+trailAfterTarget2 = input.bool(true, "Trail Stop after Target 2")
+trailAtrMultiplier = input.float(1.0, "Trail Stop ATR Multiplier", minval=0.1, step=0.1)
+exitOnOppositeSignal = input.bool(true, "Exit on Opposite Signal (Sell/Buy Exit)")
 
 tp1Input = input.float(33.0, "TP1 Exit Qty %", minval=0.0, maxval=100.0, step=0.5)
 tp2Input = input.float(33.0, "TP2 Exit Qty %", minval=0.0, maxval=100.0, step=0.5)
@@ -54,23 +69,56 @@ emaSlow = ta.ema(close, emaSlowLen)
 emaTrend = ta.ema(close, emaTrendLen)
 rsiValue = ta.rsi(close, rsiLen)
 [macdLine, macdSignal, _] = ta.macd(close, 12, 26, 9)
+adxValue = ta.adx(adxLen)
 volumeSma = ta.sma(volume, volumeLen)
 atrValue = ta.atr(atrLen)
+htfClose = request.security(syminfo.tickerid, htfTf, close)
+htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen))
 
 sessionOk = not useSessionFilter or not na(time(timeframe.period, marketSession))
+entryWindowOk = not useEntryWindow or not na(time(timeframe.period, entryWindow))
 trendLong = close > emaTrend and emaFast > emaSlow
 trendShort = close < emaTrend and emaFast < emaSlow
+htfLongOk = not useHtfTrend or htfClose > htfEma
+htfShortOk = not useHtfTrend or htfClose < htfEma
 volumeOk = volume > volumeSma * volumeMultiplier
 volatilityOk = (atrValue / close) * 100 >= minAtrPercent
+trendStrengthOk = not useAdxFilter or adxValue >= adxMin
+breakoutLong = close > ta.highest(high, breakoutLen)[1]
+breakoutShort = close < ta.lowest(low, breakoutLen)[1]
 
-longSignal = enableLong and sessionOk and trendLong and volumeOk and volatilityOk and rsiValue > rsiBull and ta.crossover(macdLine, macdSignal)
-shortSignal = enableShort and sessionOk and trendShort and volumeOk and volatilityOk and rsiValue < rsiBear and ta.crossunder(macdLine, macdSignal)
+bullishSetup = sessionOk and entryWindowOk and trendLong and htfLongOk and volumeOk and volatilityOk and trendStrengthOk and rsiValue > rsiBull and macdLine > macdSignal
+bearishSetup = sessionOk and entryWindowOk and trendShort and htfShortOk and volumeOk and volatilityOk and trendStrengthOk and rsiValue < rsiBear and macdLine < macdSignal
+
+var int tradesToday = 0
+var int lastTradeBar = na
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    tradesToday := 0
+
+tradeCountOk = tradesToday < maxTradesPerDay
+cooldownOk = na(lastTradeBar) or (bar_index - lastTradeBar > cooldownBars)
+
+longSignal = enableLong and bullishSetup and breakoutLong and tradeCountOk and cooldownOk
+shortSignal = enableShort and bearishSetup and breakoutShort and tradeCountOk and cooldownOk
+sellExitSignal = strategy.position_size > 0 and exitOnOppositeSignal and bearishSetup
+buyCoverSignal = strategy.position_size < 0 and exitOnOppositeSignal and bullishSetup
 
 if longSignal and strategy.position_size <= 0
     strategy.entry("Long", strategy.long)
+    tradesToday += 1
+    lastTradeBar := bar_index
 
 if shortSignal and strategy.position_size >= 0
     strategy.entry("Short", strategy.short)
+    tradesToday += 1
+    lastTradeBar := bar_index
+
+if sellExitSignal
+    strategy.close("Long", comment="SELL Exit")
+
+if buyCoverSignal
+    strategy.close("Short", comment="BUY Cover")
 
 // ---------------------------
 // Dynamic Targets and Stop
@@ -81,6 +129,7 @@ var float target1 = na
 var float target2 = na
 var float target3 = na
 var bool movedToBE = false
+var bool target2Reached = false
 
 newLong = strategy.position_size > 0 and strategy.position_size[1] <= 0
 newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
@@ -94,6 +143,7 @@ if newLong
     target2 := entryPrice + riskPoints * rrTarget2
     target3 := entryPrice + riskPoints * rrTarget3
     movedToBE := false
+    target2Reached := false
 
 if newShort
     entryPrice := strategy.position_avg_price
@@ -103,6 +153,7 @@ if newShort
     target2 := entryPrice - riskPoints * rrTarget2
     target3 := entryPrice - riskPoints * rrTarget3
     movedToBE := false
+    target2Reached := false
 
 if strategy.position_size > 0 and moveStopToBreakeven and not movedToBE and not na(target1) and high >= target1
     stopPrice := entryPrice
@@ -111,6 +162,20 @@ if strategy.position_size > 0 and moveStopToBreakeven and not movedToBE and not 
 if strategy.position_size < 0 and moveStopToBreakeven and not movedToBE and not na(target1) and low <= target1
     stopPrice := entryPrice
     movedToBE := true
+
+if strategy.position_size > 0 and not na(target2) and high >= target2
+    target2Reached := true
+
+if strategy.position_size < 0 and not na(target2) and low <= target2
+    target2Reached := true
+
+if strategy.position_size > 0 and trailAfterTarget2 and target2Reached and not na(stopPrice)
+    trailStopLong = close - atrValue * trailAtrMultiplier
+    stopPrice := math.max(stopPrice, trailStopLong)
+
+if strategy.position_size < 0 and trailAfterTarget2 and target2Reached and not na(stopPrice)
+    trailStopShort = close + atrValue * trailAtrMultiplier
+    stopPrice := math.min(stopPrice, trailStopShort)
 
 if strategy.position_size > 0 and not na(stopPrice)
     strategy.exit("L-TP1", "Long", stop=stopPrice, limit=target1, qty_percent=tp1Qty)
@@ -129,6 +194,7 @@ if flatNow
     target2 := na
     target3 := na
     movedToBE := false
+    target2Reached := false
 
 // ---------------------------
 // Visuals
@@ -144,7 +210,9 @@ plot(strategy.position_size != 0 ? target2 : na, "Target 2", color=color.new(col
 plot(strategy.position_size != 0 ? target3 : na, "Target 3", color=color.new(color.green, 55), style=plot.style_linebr, linewidth=2)
 
 plotshape(longSignal, title="Long Signal", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="BUY", textcolor=color.white, size=size.tiny)
-plotshape(shortSignal, title="Short Signal", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.tiny)
+plotshape(shortSignal, title="Short Signal", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SHORT", textcolor=color.white, size=size.tiny)
+plotshape(sellExitSignal, title="Sell Exit Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.orange, 0), text="SELL", textcolor=color.white, size=size.tiny)
+plotshape(buyCoverSignal, title="Buy Cover Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.teal, 0), text="BUY", textcolor=color.white, size=size.tiny)
 
 levelText(v) =>
     na(v) ? "NA" : str.tostring(v, format.mintick)
@@ -170,5 +238,9 @@ if barstate.islast
 // ---------------------------
 alertcondition(longSignal, "Long Entry", "Long entry signal on {{ticker}}")
 alertcondition(shortSignal, "Short Entry", "Short entry signal on {{ticker}}")
+alertcondition(sellExitSignal, "Sell Exit", "Sell exit signal on {{ticker}}")
+alertcondition(buyCoverSignal, "Buy Cover Exit", "Buy cover signal on {{ticker}}")
 alertcondition(strategy.position_size > 0 and not na(target1) and high >= target1, "Long Target 1 Hit", "Long Target 1 hit on {{ticker}}")
 alertcondition(strategy.position_size < 0 and not na(target1) and low <= target1, "Short Target 1 Hit", "Short Target 1 hit on {{ticker}}")
+alertcondition(strategy.position_size > 0 and not na(stopPrice) and low <= stopPrice, "Long Stop Loss Hit", "Long stop loss hit on {{ticker}}")
+alertcondition(strategy.position_size < 0 and not na(stopPrice) and high >= stopPrice, "Short Stop Loss Hit", "Short stop loss hit on {{ticker}}")
