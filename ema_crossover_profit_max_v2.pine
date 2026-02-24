@@ -1,0 +1,224 @@
+//@version=5
+strategy(
+     "EMA 9/20 Crossover PRO (Profit Max v2)",
+     overlay = true,
+     margin_long = 100,
+     margin_short = 100,
+     process_orders_on_close = true,
+     pyramiding = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 10,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04
+)
+
+// =========================
+// Inputs
+// =========================
+groupSignal = "Signal & Filters"
+emaFastLen = input.int(9, "Fast EMA", minval = 1, group = groupSignal)
+emaSlowLen = input.int(20, "Slow EMA", minval = 2, group = groupSignal)
+
+useHTFTrend = input.bool(true, "Use HTF Trend Filter", group = groupSignal)
+htfTf = input.timeframe("240", "HTF Timeframe", group = groupSignal)
+htfEmaLen = input.int(100, "HTF EMA Length", minval = 1, group = groupSignal)
+
+useAdxFilter = input.bool(true, "Use ADX Filter", group = groupSignal)
+adxLen = input.int(14, "ADX Length", minval = 2, group = groupSignal)
+adxMin = input.float(20.0, "Minimum ADX", step = 0.5, group = groupSignal)
+useDiBias = input.bool(true, "Use +DI/-DI Direction Bias", group = groupSignal)
+
+useRsiFilter = input.bool(false, "Use RSI Filter", group = groupSignal)
+rsiLen = input.int(14, "RSI Length", minval = 2, group = groupSignal)
+rsiLongMin = input.float(50.0, "Long RSI Min", step = 0.5, group = groupSignal)
+rsiShortMax = input.float(50.0, "Short RSI Max", step = 0.5, group = groupSignal)
+
+useSessionFilter = input.bool(false, "Use Session Filter", group = groupSignal)
+tradeSession = input.session("0900-1600", "Trade Session", group = groupSignal)
+cooldownBars = input.int(3, "Cooldown Bars After Exit", minval = 0, group = groupSignal)
+
+groupRisk = "Risk Management"
+atrLen = input.int(14, "ATR Length", minval = 1, group = groupRisk)
+slAtrMult = input.float(1.8, "SL ATR Multiplier", minval = 0.1, step = 0.1, group = groupRisk)
+tp1R = input.float(1.0, "TP1 (R Multiple)", minval = 0.2, step = 0.1, group = groupRisk)
+tp2R = input.float(1.8, "TP2 (R Multiple)", minval = 0.2, step = 0.1, group = groupRisk)
+tp3R = input.float(2.8, "TP3 (R Multiple)", minval = 0.2, step = 0.1, group = groupRisk)
+
+tp1QtyRaw = input.float(40, "TP1 Qty %", minval = 0, maxval = 100, group = groupRisk)
+tp2QtyRaw = input.float(35, "TP2 Qty %", minval = 0, maxval = 100, group = groupRisk)
+tp3QtyRaw = input.float(25, "TP3 Qty %", minval = 0, maxval = 100, group = groupRisk)
+
+moveToBE = input.bool(true, "Move SL to Breakeven After TP1", group = groupRisk)
+trailAfterTP2 = input.bool(true, "Enable ATR Trail After TP2", group = groupRisk)
+trailAtrMult = input.float(1.2, "Trail ATR Multiplier", minval = 0.1, step = 0.1, group = groupRisk)
+maxBarsInTrade = input.int(200, "Max Bars in Trade (0 = Off)", minval = 0, group = groupRisk)
+closeOnOpposite = input.bool(true, "Close On Opposite Cross", group = groupRisk)
+
+groupView = "Visuals"
+showSignals = input.bool(true, "Show Buy/Sell Labels", group = groupView)
+showTPSL = input.bool(true, "Show TP/SL Lines", group = groupView)
+
+// =========================
+// Core Calculations
+// =========================
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+atr = ta.atr(atrLen)
+rsi = ta.rsi(close, rsiLen)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+
+htfBull = request.security(syminfo.tickerid, htfTf, close > ta.ema(close, htfEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfBear = request.security(syminfo.tickerid, htfTf, close < ta.ema(close, htfEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+longCross = ta.crossover(emaFast, emaSlow)
+shortCross = ta.crossunder(emaFast, emaSlow)
+inSession = not useSessionFilter or not na(time(timeframe.period, tradeSession))
+
+longFilterOk = (not useHTFTrend or htfBull) and (not useAdxFilter or adx >= adxMin) and (not useDiBias or diPlus > diMinus) and (not useRsiFilter or rsi >= rsiLongMin)
+shortFilterOk = (not useHTFTrend or htfBear) and (not useAdxFilter or adx >= adxMin) and (not useDiBias or diMinus > diPlus) and (not useRsiFilter or rsi <= rsiShortMax)
+
+// Normalize partial-exit quantities to always total 100%.
+qtySum = math.max(tp1QtyRaw + tp2QtyRaw + tp3QtyRaw, 1)
+tp1Qty = tp1QtyRaw * 100.0 / qtySum
+tp2Qty = tp2QtyRaw * 100.0 / qtySum
+tp3Qty = tp3QtyRaw * 100.0 / qtySum
+
+// =========================
+// Entry Control
+// =========================
+var int lastFlatBar = na
+justFlat = strategy.position_size[1] != 0 and strategy.position_size == 0
+if justFlat
+    lastFlatBar := bar_index
+
+cooldownOk = na(lastFlatBar) or (bar_index - lastFlatBar >= cooldownBars)
+
+longSignal = longCross and longFilterOk and inSession and cooldownOk
+shortSignal = shortCross and shortFilterOk and inSession and cooldownOk
+
+if longSignal and strategy.position_size <= 0
+    strategy.entry("L", strategy.long)
+
+if shortSignal and strategy.position_size >= 0
+    strategy.entry("S", strategy.short)
+
+if closeOnOpposite and strategy.position_size > 0 and shortCross
+    strategy.close("L", comment = "Opposite cross")
+
+if closeOnOpposite and strategy.position_size < 0 and longCross
+    strategy.close("S", comment = "Opposite cross")
+
+// =========================
+// Position Management
+// =========================
+var int entryBar = na
+var float longStop = na
+var float shortStop = na
+var float longRiskUnit = na
+var float shortRiskUnit = na
+
+newLong = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if newLong or newShort
+    entryBar := bar_index
+
+if newLong
+    longRiskUnit := atr * slAtrMult
+    longStop := strategy.position_avg_price - longRiskUnit
+
+if newShort
+    shortRiskUnit := atr * slAtrMult
+    shortStop := strategy.position_avg_price + shortRiskUnit
+
+if strategy.position_size == 0
+    entryBar := na
+    longStop := na
+    shortStop := na
+    longRiskUnit := na
+    shortRiskUnit := na
+
+if strategy.position_size > 0
+    longEntry = strategy.position_avg_price
+    riskLong = na(longRiskUnit) ? atr * slAtrMult : longRiskUnit
+    tp1Long = longEntry + riskLong * tp1R
+    tp2Long = longEntry + riskLong * tp2R
+    tp3Long = longEntry + riskLong * tp3R
+
+    longStop := na(longStop) ? longEntry - riskLong : longStop
+
+    if moveToBE and high >= tp1Long
+        longStop := math.max(longStop, longEntry)
+
+    if trailAfterTP2 and high >= tp2Long
+        trailStopLong = close - atr * trailAtrMult
+        longStop := math.max(longStop, trailStopLong)
+
+    strategy.exit("L-TP1", from_entry = "L", limit = tp1Long, stop = longStop, qty_percent = tp1Qty)
+    strategy.exit("L-TP2", from_entry = "L", limit = tp2Long, stop = longStop, qty_percent = tp2Qty)
+    strategy.exit("L-TP3", from_entry = "L", limit = tp3Long, stop = longStop, qty_percent = tp3Qty)
+
+if strategy.position_size < 0
+    shortEntry = strategy.position_avg_price
+    riskShort = na(shortRiskUnit) ? atr * slAtrMult : shortRiskUnit
+    tp1Short = shortEntry - riskShort * tp1R
+    tp2Short = shortEntry - riskShort * tp2R
+    tp3Short = shortEntry - riskShort * tp3R
+
+    shortStop := na(shortStop) ? shortEntry + riskShort : shortStop
+
+    if moveToBE and low <= tp1Short
+        shortStop := math.min(shortStop, shortEntry)
+
+    if trailAfterTP2 and low <= tp2Short
+        trailStopShort = close + atr * trailAtrMult
+        shortStop := math.min(shortStop, trailStopShort)
+
+    strategy.exit("S-TP1", from_entry = "S", limit = tp1Short, stop = shortStop, qty_percent = tp1Qty)
+    strategy.exit("S-TP2", from_entry = "S", limit = tp2Short, stop = shortStop, qty_percent = tp2Qty)
+    strategy.exit("S-TP3", from_entry = "S", limit = tp3Short, stop = shortStop, qty_percent = tp3Qty)
+
+if maxBarsInTrade > 0 and not na(entryBar)
+    barsInTrade = bar_index - entryBar
+    if strategy.position_size > 0 and barsInTrade >= maxBarsInTrade
+        strategy.close("L", comment = "Max bars")
+    if strategy.position_size < 0 and barsInTrade >= maxBarsInTrade
+        strategy.close("S", comment = "Max bars")
+
+// =========================
+// Plotting
+// =========================
+plot(emaFast, color = color.new(color.blue, 0), title = "EMA Fast", linewidth = 2)
+plot(emaSlow, color = color.new(color.orange, 0), title = "EMA Slow", linewidth = 2)
+
+plotshape(showSignals and longSignal, title = "BUY", location = location.belowbar, color = color.new(color.green, 0), style = shape.labelup, text = "BUY")
+plotshape(showSignals and shortSignal, title = "SELL", location = location.abovebar, color = color.new(color.red, 0), style = shape.labeldown, text = "SELL")
+
+longLineEntry = strategy.position_size > 0 ? strategy.position_avg_price : na
+shortLineEntry = strategy.position_size < 0 ? strategy.position_avg_price : na
+entryLine = strategy.position_size > 0 ? longLineEntry : shortLineEntry
+
+float lineTp1 = na
+float lineTp2 = na
+float lineTp3 = na
+float lineSl = na
+
+if strategy.position_size > 0
+    riskL = na(longRiskUnit) ? atr * slAtrMult : longRiskUnit
+    lineTp1 := strategy.position_avg_price + riskL * tp1R
+    lineTp2 := strategy.position_avg_price + riskL * tp2R
+    lineTp3 := strategy.position_avg_price + riskL * tp3R
+    lineSl := longStop
+else if strategy.position_size < 0
+    riskS = na(shortRiskUnit) ? atr * slAtrMult : shortRiskUnit
+    lineTp1 := strategy.position_avg_price - riskS * tp1R
+    lineTp2 := strategy.position_avg_price - riskS * tp2R
+    lineTp3 := strategy.position_avg_price - riskS * tp3R
+    lineSl := shortStop
+
+plot(showTPSL ? entryLine : na, "Entry", color = color.new(color.gray, 40), style = plot.style_linebr, linewidth = 1)
+plot(showTPSL ? lineTp1 : na, "TP1", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1)
+plot(showTPSL ? lineTp2 : na, "TP2", color = color.new(color.green, 30), style = plot.style_linebr, linewidth = 1)
+plot(showTPSL ? lineTp3 : na, "TP3", color = color.new(color.green, 55), style = plot.style_linebr, linewidth = 1)
+plot(showTPSL ? lineSl : na, "SL", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+
