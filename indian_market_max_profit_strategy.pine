@@ -1,0 +1,130 @@
+//@version=5
+strategy(
+     "Indian Market Profit Optimizer (EMA + Breakout + ATR)",
+     overlay=true,
+     initial_capital=100000,
+     currency=currency.INR,
+     commission_type=strategy.commission.percent,
+     commission_value=0.03,
+     slippage=1,
+     pyramiding=0,
+     process_orders_on_close=true
+ )
+
+// ===== Session / Instrument Settings =====
+groupSession = "Session Settings (India)"
+marketSession = input.session("0915-1530", "Trading Session (IST)", group=groupSession)
+skipOpenMinutes = input.int(15, "Skip first N minutes", minval=0, maxval=120, group=groupSession)
+squareOffMinutes = input.int(10, "Square-off N minutes before close", minval=0, maxval=60, group=groupSession)
+forceFlatOutsideSession = input.bool(true, "Force flat outside session", group=groupSession)
+enableLongs = input.bool(true, "Enable Long Trades", group=groupSession)
+enableShorts = input.bool(true, "Enable Short Trades", group=groupSession)
+
+// ===== Entry Logic Settings =====
+groupSignal = "Signal Filters"
+fastEmaLen = input.int(21, "Fast EMA", minval=1, group=groupSignal)
+slowEmaLen = input.int(55, "Slow EMA", minval=2, group=groupSignal)
+breakoutLen = input.int(20, "Breakout Lookback", minval=2, group=groupSignal)
+adxLen = input.int(14, "ADX Length", minval=2, group=groupSignal)
+adxSmoothing = input.int(14, "ADX Smoothing", minval=2, group=groupSignal)
+adxThreshold = input.float(20.0, "Minimum ADX", minval=5, step=0.5, group=groupSignal)
+rsiLen = input.int(14, "RSI Length", minval=2, group=groupSignal)
+rsiLongMin = input.float(52.0, "RSI minimum for Long", minval=0, maxval=100, step=0.5, group=groupSignal)
+rsiShortMax = input.float(48.0, "RSI maximum for Short", minval=0, maxval=100, step=0.5, group=groupSignal)
+volumeLen = input.int(20, "Volume SMA Length", minval=1, group=groupSignal)
+volumeMult = input.float(1.2, "Volume Multiplier", minval=0.1, step=0.1, group=groupSignal)
+useVWAPFilter = input.bool(true, "Use VWAP Trend Filter", group=groupSignal)
+
+// ===== Risk / Exit Settings =====
+groupRisk = "Risk Management"
+riskPct = input.float(1.0, "Risk % of equity / trade", minval=0.1, maxval=5, step=0.1, group=groupRisk)
+atrLen = input.int(14, "ATR Length", minval=1, group=groupRisk)
+atrStopMult = input.float(1.8, "ATR Stop Multiplier", minval=0.5, step=0.1, group=groupRisk)
+rewardRisk = input.float(2.5, "Reward:Risk Target", minval=1.0, step=0.1, group=groupRisk)
+useTrailingStop = input.bool(true, "Use Trailing Stop", group=groupRisk)
+trailAtrMult = input.float(1.2, "ATR Trailing Multiplier", minval=0.2, step=0.1, group=groupRisk)
+lotSize = input.int(1, "Lot Size (for derivatives)", minval=1, group=groupRisk)
+maxQty = input.float(100000, "Max Quantity Cap", minval=1, group=groupRisk)
+
+// ===== Time Logic (IST) =====
+inSession = not na(time(timeframe.period, marketSession, "Asia/Kolkata"))
+sessionOpenTs = timestamp("Asia/Kolkata", year, month, dayofmonth, 9, 15)
+sessionCloseTs = timestamp("Asia/Kolkata", year, month, dayofmonth, 15, 30)
+minutesFromOpen = (time - sessionOpenTs) / 60000.0
+minutesToClose = (sessionCloseTs - time) / 60000.0
+
+entryWindow = inSession and minutesFromOpen >= skipOpenMinutes and minutesToClose > squareOffMinutes
+
+// ===== Indicator Calculations =====
+emaFast = ta.ema(close, fastEmaLen)
+emaSlow = ta.ema(close, slowEmaLen)
+rsiValue = ta.rsi(close, rsiLen)
+[plusDI, minusDI, adxValue] = ta.dmi(adxLen, adxSmoothing)
+vwapValue = ta.vwap(hlc3)
+avgVolume = ta.sma(volume, volumeLen)
+volumeOk = volume > avgVolume * volumeMult
+atrValue = ta.atr(atrLen)
+
+breakoutHigh = ta.highest(high, breakoutLen)[1]
+breakoutLow = ta.lowest(low, breakoutLen)[1]
+
+trendUp = emaFast > emaSlow and adxValue > adxThreshold
+trendDown = emaFast < emaSlow and adxValue > adxThreshold
+vwapLongOk = not useVWAPFilter or close > vwapValue
+vwapShortOk = not useVWAPFilter or close < vwapValue
+
+longSignal = entryWindow and enableLongs and trendUp and rsiValue >= rsiLongMin and vwapLongOk and volumeOk and close > breakoutHigh
+shortSignal = entryWindow and enableShorts and trendDown and rsiValue <= rsiShortMax and vwapShortOk and volumeOk and close < breakoutLow
+
+// ===== Position Sizing (ATR Risk Model) =====
+stopDistance = atrValue * atrStopMult
+riskCapital = strategy.equity * (riskPct / 100.0)
+rawQty = stopDistance > 0 ? riskCapital / stopDistance : na
+qtyRounded = not na(rawQty) ? math.floor(rawQty / lotSize) * lotSize : na
+positionQty = not na(qtyRounded) ? math.min(maxQty, math.max(lotSize, qtyRounded)) : na
+
+if longSignal and strategy.position_size <= 0 and not na(positionQty)
+    strategy.entry("Long", strategy.long, qty=positionQty)
+
+if shortSignal and strategy.position_size >= 0 and not na(positionQty)
+    strategy.entry("Short", strategy.short, qty=positionQty)
+
+// ===== Exit Logic =====
+longStop = strategy.position_avg_price - stopDistance
+longTarget = strategy.position_avg_price + (stopDistance * rewardRisk)
+shortStop = strategy.position_avg_price + stopDistance
+shortTarget = strategy.position_avg_price - (stopDistance * rewardRisk)
+trailTicks = int(math.max(1, math.round((atrValue * trailAtrMult) / syminfo.mintick)))
+
+if strategy.position_size > 0
+    if useTrailingStop
+        strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=longTarget, trail_points=trailTicks, trail_offset=trailTicks)
+    else
+        strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=longTarget)
+
+if strategy.position_size < 0
+    if useTrailingStop
+        strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=shortTarget, trail_points=trailTicks, trail_offset=trailTicks)
+    else
+        strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=shortTarget)
+
+shouldSquareOff = inSession and minutesToClose <= squareOffMinutes
+if shouldSquareOff and strategy.position_size != 0
+    strategy.close_all(comment="Pre-close square-off")
+
+if forceFlatOutsideSession and not inSession and strategy.position_size != 0
+    strategy.close_all(comment="Outside session flat")
+
+// ===== Visuals =====
+plot(emaFast, "EMA Fast", color=color.new(color.teal, 0), linewidth=2)
+plot(emaSlow, "EMA Slow", color=color.new(color.orange, 0), linewidth=2)
+plot(useVWAPFilter ? vwapValue : na, "VWAP", color=color.new(color.blue, 30), linewidth=2)
+plot(breakoutHigh, "Breakout High", color=color.new(color.green, 70), style=plot.style_linebr)
+plot(breakoutLow, "Breakout Low", color=color.new(color.red, 70), style=plot.style_linebr)
+bgcolor(entryWindow ? color.new(color.green, 93) : color.new(color.gray, 96), title="Entry Window")
+
+plotshape(longSignal, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny, text="L")
+plotshape(shortSignal, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny, text="S")
+
+alertcondition(longSignal, title="Long Entry Alert", message="Indian Market Optimizer: Long signal")
+alertcondition(shortSignal, title="Short Entry Alert", message="Indian Market Optimizer: Short signal")
